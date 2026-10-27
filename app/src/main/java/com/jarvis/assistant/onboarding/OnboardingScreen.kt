@@ -18,10 +18,10 @@ import androidx.compose.ui.unit.dp
 private val onboardingPoints = listOf(
     "Microphone" to "JARVIS uses the microphone only while you have turned listening on, so it can hear you speak to it.",
     "Visible while active" to "Listening runs as a foreground service. A notification is shown the whole time, with a Stop button.",
-    "On-device" to "Wake-word detection and speech recognition are designed to run locally on this phone. Audio is kept in memory and never saved or uploaded.",
+    "On-device" to "Wake-word detection (\"Hey Jarvis\") and speech recognition run locally on this phone using the open-source Vosk engine. Audio is kept in memory and never saved or uploaded.",
     "Optional features" to "Features like reading notifications will ask for extra permissions only when you turn them on.",
     "You stay in control" to "Tap Stop in the app or notification at any time. You can revoke permissions in Android Settings > Apps > JARVIS > Permissions.",
-    "Models" to "Some voice models may need a one-time download later. Their size, source and license will be shown before downloading.",
+    "Speech model" to "Listening needs a one-time download of the Vosk small English model (about 39 MB, Apache 2.0, from alphacephei.com). This is the only time the internet is used; you can also import the file yourself. It is checked before installing and can be deleted at any time.",
 )
 
 /**

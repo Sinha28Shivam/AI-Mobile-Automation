@@ -22,7 +22,13 @@ class ServiceStateTest {
 
     @Test
     fun activeFlagMatchesPipelineStates() {
-        listOf(ServiceState.Listening, ServiceState.HeardWakeWord, ServiceState.Processing, ServiceState.Speaking)
+        listOf(
+            ServiceState.Starting,
+            ServiceState.Listening,
+            ServiceState.HeardWakeWord,
+            ServiceState.Processing,
+            ServiceState.Speaking,
+        )
             .forEach { assertTrue("$it should be active", it.isActive) }
         listOf(ServiceState.Stopped, ServiceState.PermissionRequired, ServiceState.Error("x"))
             .forEach { assertFalse("$it should be inactive", it.isActive) }

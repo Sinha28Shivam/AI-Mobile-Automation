@@ -6,4 +6,5 @@
     <string name="notification_title">JARVIS is listening</string>
     <string name="notification_text">Microphone active. Audio is processed on-device and never saved.</string>
     <string name="notification_action_stop">Stop</string>
+    <string name="notification_action_talk">Talk now</string>
 </resources>

@@ -7,6 +7,9 @@ import kotlinx.coroutines.flow.asStateFlow
 /** Lifecycle state of the listening pipeline, shown in the UI and notification. */
 sealed interface ServiceState {
     data object Stopped : ServiceState
+
+    /** Foreground service is up and loading the local speech models. */
+    data object Starting : ServiceState
     data object Listening : ServiceState
     data object HeardWakeWord : ServiceState
     data object Processing : ServiceState
@@ -17,14 +20,15 @@ sealed interface ServiceState {
     /** True while the foreground service owns the microphone pipeline. */
     val isActive: Boolean
         get() = when (this) {
-            Listening, HeardWakeWord, Processing, Speaking -> true
+            Starting, Listening, HeardWakeWord, Processing, Speaking -> true
             Stopped, PermissionRequired, is Error -> false
         }
 
     val label: String
         get() = when (this) {
             Stopped -> "Stopped"
-            Listening -> "Listening"
+            Starting -> "Starting (loading speech model)"
+            Listening -> "Listening for \"Hey Jarvis\""
             HeardWakeWord -> "Heard wake word"
             Processing -> "Processing"
             Speaking -> "Speaking"
@@ -59,5 +63,35 @@ object ServiceStateRepository {
 
     fun reset() {
         _state.value = ServiceState.Stopped
+    }
+}
+
+/** Non-fatal, user-visible notices (e.g. voice output unavailable). Never contains user speech. */
+object ServiceNoticeRepository {
+    private val _notice = MutableStateFlow<String?>(null)
+    val notice: StateFlow<String?> = _notice.asStateFlow()
+
+    fun post(message: String) {
+        _notice.value = message
+    }
+
+    fun clear() {
+        _notice.value = null
+    }
+}
+
+/** The most recent command and reply. Only populated when local history is enabled; memory only. */
+data class LastExchange(val command: String, val reply: String?)
+
+object LastExchangeRepository {
+    private val _last = MutableStateFlow<LastExchange?>(null)
+    val last: StateFlow<LastExchange?> = _last.asStateFlow()
+
+    fun set(exchange: LastExchange?) {
+        _last.value = exchange
+    }
+
+    fun clear() {
+        _last.value = null
     }
 }
