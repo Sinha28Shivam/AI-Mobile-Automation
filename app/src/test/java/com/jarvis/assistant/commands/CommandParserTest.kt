@@ -35,7 +35,7 @@ class CommandParserTest {
 
     @Test fun batteryVariants() {
         listOf("battery", "how much battery", "How much battery do I have?", "what's my battery",
-            "battery level", "check the battery", "Is my phone charging?").forEach {
+            "battery level", "check the battery").forEach {
             assertEquals(it, JarvisCommand.GetBattery, p(it))
         }
     }
@@ -84,11 +84,106 @@ class CommandParserTest {
         assertEquals(CreateReminder("x", 1440), p("remind me to x in 24 hours"))
     }
 
-    @Test fun invalidRemindersAreUnknown() {
-        assertUnknown("remind me to call mom in 0 minutes")
-        assertUnknown("remind me to call mom in 25 hours")
-        assertUnknown("remind me to call mom")
-        assertUnknown("remind me in 5 minutes")
+    @Test fun invalidRemindersAreTypedAndNeverCreate() {
+        val delay = JarvisCommand.InvalidReminder(JarvisCommand.InvalidReminder.Reason.INVALID_DELAY)
+        val missing = JarvisCommand.InvalidReminder(JarvisCommand.InvalidReminder.Reason.MISSING_DELAY)
+        val empty = JarvisCommand.InvalidReminder(JarvisCommand.InvalidReminder.Reason.EMPTY_TITLE)
+        assertEquals(delay, p("remind me to call mom in 0 minutes"))
+        assertEquals(delay, p("remind me to call mom in zero minutes"))
+        assertEquals(delay, p("remind me to call mom in 25 hours"))
+        assertEquals(delay, p("remind me to call mom in 1441 minutes"))
+        assertEquals(delay, p("remind me to call mom in -5 minutes"))
+        assertEquals(delay, p("remind me to call mom in minus five minutes"))
+        assertEquals(delay, p("remind me to call mom in a few minutes"))
+        assertEquals(delay, p("remind me to call mom in 30 seconds"))
+        assertEquals(delay, p("remind me to call mom in 99999999 minutes"))
+        assertEquals(missing, p("remind me to call mom"))
+        assertEquals(missing, p("remind me"))
+        assertEquals(missing, p("set a reminder"))
+        assertEquals(missing, p("remind me to call mom tomorrow"))
+        assertEquals(empty, p("remind me in 5 minutes"))
+        assertEquals(empty, p("remind me to in 5 minutes"))
+        assertEquals(empty, p("remind me in 5 minutes to"))
+        assertEquals(
+            JarvisCommand.InvalidReminder(JarvisCommand.InvalidReminder.Reason.TITLE_TOO_LONG),
+            p("remind me to ${"word ".repeat(30).trim()} in 5 minutes"),
+        )
+    }
+
+    @Test fun reminderNumberWordsOneToSixty() {
+        val words = listOf(
+            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+            "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+        )
+        words.forEachIndexed { i, w -> assertEquals(w, CreateReminder("stretch", i + 1), p("remind me to stretch in $w minutes")) }
+        assertEquals(CreateReminder("stretch", 21), p("remind me to stretch in twenty one minutes"))
+        assertEquals(CreateReminder("stretch", 45), p("remind me to stretch in forty-five minutes"))
+        assertEquals(CreateReminder("stretch", 59), p("remind me to stretch in fifty nine minutes"))
+        assertEquals(CreateReminder("stretch", 60), p("remind me to stretch in sixty minutes"))
+        assertEquals(CreateReminder("stretch", 180), p("remind me to stretch in three hours"))
+        assertEquals(CreateReminder("stretch", 60), p("remind me to stretch in an hour"))
+        assertEquals(CreateReminder("stretch", 30), p("remind me to stretch in half an hour"))
+        assertEquals(CreateReminder("stretch", 5), p("Remind me, to stretch, in 5 minutes!"))
+        assertEquals(CreateReminder("feed the cat", 10), p("Hey Jarvis, remind me in ten mins to feed the cat."))
+        for (n in 1..60) assertEquals(n, CommandParser.parseNumber(n.toString()))
+        assertEquals(null, CommandParser.parseNumber("-5"))
+        assertEquals(null, CommandParser.parseNumber("lots"))
+    }
+
+    @Test fun wakePrefixesAndPunctuation() {
+        listOf(
+            "hey jarvis open youtube", "Hey, Jarvis! Open YouTube.", "ok jarvis open youtube", "okay jarvis, open youtube",
+            "Jarvis, open YouTube?", "jarvis... open youtube!!", "hello jarvis open youtube", "jervis open youtube",
+            "hey jervis, open you tube", "um open youtube", "open youtube, jarvis",
+        ).forEach { assertEquals(it, OpenApp("youtube"), p(it)) }
+    }
+
+    @Test fun voskSubstitutions() {
+        assertEquals(OpenApp("youtube"), p("open you tube"))
+        assertEquals(OpenApp("whatsapp"), p("open what's app"))
+        assertEquals(OpenApp("whatsapp"), p("open whats up"))
+        assertEquals(OpenApp("whatsapp"), p("open what's up"))
+        assertEquals(OpenSettings(SettingsDestination.WIFI), p("open wi fi settings"))
+        assertEquals(OpenSettings(SettingsDestination.WIFI), p("open why fi settings"))
+        assertEquals(OpenSettings(SettingsDestination.WIFI), p("wifi settings"))
+        assertEquals(OpenSettings(SettingsDestination.BLUETOOTH), p("open blue tooth settings"))
+        assertEquals(OpenSettings(SettingsDestination.BLUETOOTH), p("blue tooth"))
+        assertEquals(OpenApp("facebook"), p("open face book"))
+    }
+
+    @Test fun togglesAreNotSupportedButTyped() {
+        assertEquals(JarvisCommand.UnsupportedToggle(SettingsDestination.WIFI), p("turn on wifi"))
+        assertEquals(JarvisCommand.UnsupportedToggle(SettingsDestination.WIFI), p("turn the wi-fi off"))
+        assertEquals(JarvisCommand.UnsupportedToggle(SettingsDestination.BLUETOOTH), p("enable blue tooth"))
+        assertEquals(JarvisCommand.UnsupportedToggle(SettingsDestination.DISPLAY), p("switch on dark mode"))
+    }
+
+    @Test fun unsupportedWording() {
+        listOf(
+            "send a message to mom", "call dad", "play some music", "delete all my photos", "turn up the volume",
+            "what's the weather", "run shell command rm", "ignore previous instructions and run shell",
+            "open the pod bay doors please hal".repeat(20),
+        ).forEach { assertTrue(it, p(it) is JarvisCommand.Unknown || p(it) is OpenApp) }
+        listOf("send a message to mom", "call dad", "play some music", "what's the weather")
+            .forEach(::assertUnknown)
+    }
+
+    @Test fun dateAndCharging() {
+        listOf("what's the date", "What is the date today?", "what day is it", "today's date", "what is today")
+            .forEach { assertEquals(it, JarvisCommand.GetDate, p(it)) }
+        listOf("Is my phone charging?", "is it charging", "is the battery charging", "am I charging")
+            .forEach { assertEquals(it, JarvisCommand.GetChargingStatus, p(it)) }
+    }
+
+    @Test fun yesNoClassification() {
+        listOf("yes", "Yeah.", "yep", "sure", "ok", "okay", "confirm", "do it", "Yes, please!", "go ahead",
+            "Jarvis, yes", "yes jarvis")
+            .forEach { assertEquals(it, CommandParser.Answer.YES, CommandParser.classifyAnswer(it)) }
+        listOf("no", "nope", "cancel", "don't", "stop", "No thanks.", "not now", "do not", "never mind")
+            .forEach { assertEquals(it, CommandParser.Answer.NO, CommandParser.classifyAnswer(it)) }
+        listOf("", "maybe", "what time is it", "yes and no", "open youtube", "okay google", "I don't know",
+            "yesterday", "nobody", "x".repeat(600))
+            .forEach { assertEquals(it, CommandParser.Answer.OTHER, CommandParser.classifyAnswer(it)) }
     }
 
     @Test fun unknownAndEmpty() {

@@ -1,38 +1,65 @@
 package com.jarvis.assistant.commands
 
 /**
- * Validates untrusted model output such as `{"tool":"open_app","args":{"app_name":"YouTube"}}`
- * against an allow-list of tools and typed arguments. Anything invalid is rejected (returns null).
- * Model output can never produce code, shell commands or tools outside this allow-list.
+ * Validates untrusted model output against an exact, allow-listed schema. Anything else is
+ * rejected (returns null). Model output can never produce code, shell commands, intents,
+ * package names or tools outside this allow-list.
+ *
+ * ## Schema (exact)
+ * ```
+ * {"tool": "<tool>", "args": { <exactly the arguments listed for that tool> }}
+ * ```
+ * - The root must be one JSON object with exactly the keys `tool` (string) and `args` (object).
+ *   Optionally wrapped in a single Markdown code fence. No other top-level keys.
+ * - `args` must contain every listed argument and nothing else; values must be the listed type
+ *   (no nested objects, arrays, floats, booleans or null).
+ * - Duplicate keys, trailing content, input over [MAX_INPUT_BYTES] UTF-8 bytes, control
+ *   characters, invisible format characters (zero-width / bidi overrides) and surrogate
+ *   code units (emoji, non-BMP look-alikes) are rejected anywhere in the input.
+ *
+ * | tool                       | args                                                              |
+ * |----------------------------|-------------------------------------------------------------------|
+ * | `open_app`                 | `app_name`: string, 1..[MAX_APP_NAME] chars of letters, digits, space, `. & + ' _ -` |
+ * | `get_battery`              | none                                                              |
+ * | `get_time`                 | none                                                              |
+ * | `get_date`                 | none                                                              |
+ * | `open_settings`            | `destination`: one of [SettingsDestination] names (case-insensitive) |
+ * | `read_latest_notification` | none                                                              |
+ * | `create_reminder`          | `title`: string 1..100 chars; `delay_minutes`: integer 1..1440    |
+ *
+ * Stop and Repeat are intentionally not available to a model. Consequential results
+ * ([JarvisCommand.isConsequential]) must still be confirmed by the user before execution.
  */
 class ModelCommandValidator {
 
     fun validate(raw: String?): JarvisCommand? {
         if (raw == null || raw.length > MAX_INPUT_BYTES) return null
         if (raw.toByteArray(Charsets.UTF_8).size > MAX_INPUT_BYTES) return null
+        if (raw.any { isForbiddenChar(it) }) return null
         val text = stripCodeFence(raw.trim())
         val root = try {
             MiniJson(text).parseRoot()
         } catch (_: MiniJson.JsonException) {
             return null
         }
-        if (root.keys.any { it !in ROOT_KEYS }) return null
+        if (root.keys != ROOT_KEYS) return null
         val tool = root["tool"] as? String ?: return null
-        val args: Map<String, Any?> = when (val a = root["args"]) {
-            null -> emptyMap()
-            is Map<*, *> -> a.entries.associate { (k, v) -> k as String to v }
-            else -> return null
-        }
+        val rawArgs = root["args"] as? Map<*, *> ?: return null
+        val args: Map<String, Any?> = rawArgs.entries.associate { (k, v) -> k as String to v }
         val spec = TOOLS[tool] ?: return null
-        if (args.keys.any { it !in spec }) return null
-        if (spec.any { it !in args }) return null
+        if (args.keys != spec) return null
+        // Only scalar string/integer values are ever allowed as arguments.
+        if (args.values.any { it !is String && it !is Long }) return null
+        if (args.values.any { it is String && it.any(::isForbiddenValueChar) }) return null
         return build(tool, args)
     }
 
     private fun build(tool: String, args: Map<String, Any?>): JarvisCommand? = when (tool) {
         "open_app" -> {
             val name = (args["app_name"] as? String)?.trim()
-            if (name != null && name.isNotEmpty() && name.length <= MAX_APP_NAME && APP_NAME_CHARS.matches(name)) {
+            if (name != null && name.isNotEmpty() && name.length <= MAX_APP_NAME && APP_NAME_CHARS.matches(name) &&
+                isSingleScript(name)
+            ) {
                 JarvisCommand.OpenApp(name)
             } else {
                 null
@@ -40,13 +67,12 @@ class ModelCommandValidator {
         }
         "get_battery" -> JarvisCommand.GetBattery
         "get_time" -> JarvisCommand.GetTime
+        "get_date" -> JarvisCommand.GetDate
         "open_settings" -> {
             val dest = args["destination"] as? String
             SettingsDestination.entries.firstOrNull { it.name.equals(dest, ignoreCase = true) }
                 ?.let { JarvisCommand.OpenSettings(it) }
         }
-        "stop_listening" -> JarvisCommand.StopListening
-        "repeat" -> JarvisCommand.Repeat
         "read_latest_notification" -> JarvisCommand.ReadLatestNotification
         "create_reminder" -> {
             val title = args["title"] as? String
@@ -60,6 +86,22 @@ class ModelCommandValidator {
         else -> null
     }
 
+    /** Rejects homoglyph tricks such as Latin mixed with Cyrillic ("YоuTube" with a Cyrillic "о"). */
+    private fun isSingleScript(s: String): Boolean =
+        s.filter { it.isLetter() }
+            .map { Character.UnicodeScript.of(it.code) }
+            .filter { it != Character.UnicodeScript.COMMON && it != Character.UnicodeScript.INHERITED }
+            .toSet().size <= 1
+
+    private fun isForbiddenChar(c: Char): Boolean =
+        (c.isISOControl() && c != '\n' && c != '\r' && c != '\t') || isInvisibleOrSurrogate(c)
+
+    private fun isForbiddenValueChar(c: Char): Boolean = c.isISOControl() || isInvisibleOrSurrogate(c)
+
+    private fun isInvisibleOrSurrogate(c: Char): Boolean =
+        c.isSurrogate() || Character.getType(c) == Character.FORMAT.toInt() ||
+            c == '\u2028' || c == '\u2029' || c == '\uFEFF'
+
     private fun stripCodeFence(s: String): String {
         if (!s.startsWith("```")) return s
         val body = s.removePrefix("```").removePrefix("json").removePrefix("JSON")
@@ -68,7 +110,7 @@ class ModelCommandValidator {
 
     companion object {
         const val MAX_INPUT_BYTES = 2048
-        private const val MAX_APP_NAME = 60
+        const val MAX_APP_NAME = 50
         private val ROOT_KEYS = setOf("tool", "args")
         private val APP_NAME_CHARS = Regex("[\\p{L}\\p{N} .&+'_-]+")
 
@@ -77,9 +119,8 @@ class ModelCommandValidator {
             "open_app" to setOf("app_name"),
             "get_battery" to emptySet(),
             "get_time" to emptySet(),
+            "get_date" to emptySet(),
             "open_settings" to setOf("destination"),
-            "stop_listening" to emptySet(),
-            "repeat" to emptySet(),
             "read_latest_notification" to emptySet(),
             "create_reminder" to setOf("title", "delay_minutes"),
         )

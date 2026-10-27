@@ -97,4 +97,16 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
     // Real org.json for JVM unit tests (android.jar only ships throwing stubs).
     testImplementation(libs.org.json)
+
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.rules)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.test.espresso.core)
+    androidTestImplementation(libs.androidx.test.uiautomator)
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    androidTestImplementation(libs.kotlinx.coroutines.test)
+    // Hosts the empty activity that createComposeRule() needs; debug-only.
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
 }

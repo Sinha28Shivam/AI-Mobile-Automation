@@ -15,9 +15,21 @@ enum class SettingsDestination(val spokenName: String) {
 
 /** Typed, allow-listed commands. Anything else is [Unknown]. */
 sealed interface JarvisCommand {
+    /**
+     * Consequential commands change state outside the conversation (e.g. schedule something).
+     * They require explicit confirmation when proposed by a model or heard with low confidence.
+     */
+    val isConsequential: Boolean get() = false
+
     data class OpenApp(val appName: String) : JarvisCommand
     data object GetBattery : JarvisCommand
+
+    /** Read-only: answers "is my phone charging" from the same battery status. */
+    data object GetChargingStatus : JarvisCommand
     data object GetTime : JarvisCommand
+
+    /** Read-only: today's locale-formatted date. */
+    data object GetDate : JarvisCommand
     data class OpenSettings(val destination: SettingsDestination) : JarvisCommand
     data object StopListening : JarvisCommand
     data object Repeat : JarvisCommand
@@ -29,6 +41,8 @@ sealed interface JarvisCommand {
             require(isValidTitle(title)) { "Invalid reminder title" }
             require(delayMinutes in MIN_DELAY_MINUTES..MAX_DELAY_MINUTES) { "Delay out of range" }
         }
+
+        override val isConsequential: Boolean get() = true
 
         companion object {
             const val MIN_DELAY_MINUTES = 1
@@ -46,6 +60,14 @@ sealed interface JarvisCommand {
             }
         }
     }
+
+    /** A reminder request that was recognized but cannot be scheduled as spoken. Never executes. */
+    data class InvalidReminder(val reason: Reason) : JarvisCommand {
+        enum class Reason { MISSING_DELAY, INVALID_DELAY, EMPTY_TITLE, TITLE_TOO_LONG }
+    }
+
+    /** "Turn on Wi-Fi" etc. JARVIS never toggles settings; it may only offer the settings screen. */
+    data class UnsupportedToggle(val destination: SettingsDestination) : JarvisCommand
 
     data class Unknown(val originalText: String) : JarvisCommand
 }

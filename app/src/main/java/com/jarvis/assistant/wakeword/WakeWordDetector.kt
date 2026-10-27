@@ -35,6 +35,13 @@ interface WakeWordDetector {
     /** Feeds [length] PCM16 16 kHz mono samples of [frame]. The array is not retained. */
     fun onFrame(frame: ShortArray, length: Int)
 
+    /**
+     * Called when a command session triggered by this detector (or tap-to-talk) has fully ended.
+     * Implementations restart their cooldown here so the tail of the same utterance, or the
+     * assistant's own reply, cannot immediately trigger another session.
+     */
+    fun onSessionEnded() {}
+
     /** Frees engine resources; the detector is unusable afterwards. */
     fun release()
 }

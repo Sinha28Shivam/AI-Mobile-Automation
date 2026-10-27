@@ -20,6 +20,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import com.jarvis.assistant.tools.AndroidReminderTool
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.jarvis.assistant.onboarding.OnboardingScreen
 import com.jarvis.assistant.ui.HomeScreen
@@ -30,6 +34,12 @@ import com.jarvis.assistant.ui.SettingsScreen
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (savedInstanceState == null) {
+            val appContext = applicationContext
+            lifecycleScope.launch(Dispatchers.IO) {
+                runCatching { AndroidReminderTool.rescheduleAll(appContext) }
+            }
+        }
         enableEdgeToEdge()
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
@@ -39,6 +49,7 @@ class MainActivity : ComponentActivity() {
                 val modelState by viewModel.modelState.collectAsStateWithLifecycle()
                 val lastExchange by viewModel.lastExchange.collectAsStateWithLifecycle()
                 val notice by viewModel.notice.collectAsStateWithLifecycle()
+                val diagnostics by viewModel.diagnostics.collectAsStateWithLifecycle()
                 var showModelSetup by rememberSaveable { mutableStateOf(false) }
                 var showSettings by rememberSaveable { mutableStateOf(false) }
 
@@ -88,6 +99,7 @@ class MainActivity : ComponentActivity() {
                             historyEnabled = current.historyEnabled,
                             lastExchange = lastExchange,
                             notice = notice,
+                            diagnostics = diagnostics,
                             onStart = viewModel::startListening,
                             onStop = viewModel::stopListening,
                             onTapToTalk = viewModel::tapToTalk,
@@ -98,6 +110,7 @@ class MainActivity : ComponentActivity() {
                                 showModelSetup = true
                             },
                             onOpenSettings = { showSettings = true },
+                            onDismissError = viewModel::dismissError,
                             modifier = contentModifier,
                         )
                     }

@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Used only for the user-initiated, one-time speech model download. Audio is never uploaded. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Only re-registers saved reminders after a reboot; never starts listening or the microphone. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Package visibility limited to launchable apps (open-app command) and TTS engines. -->
     <queries>
@@ -76,6 +78,16 @@
         <receiver
             android:name=".tools.ReminderReceiver"
             android:exported="false" />
+
+        <!-- Reschedules saved reminders only; does not start listening. -->
+        <receiver
+            android:name=".tools.ReminderBootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

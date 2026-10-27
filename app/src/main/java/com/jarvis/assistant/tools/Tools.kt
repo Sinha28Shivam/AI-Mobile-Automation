@@ -27,6 +27,9 @@ interface DeviceInfoTool {
 
     /** Locale-formatted current time, e.g. "3:45 PM". */
     fun currentTimeText(): String
+
+    /** Locale-formatted current date, e.g. "Tuesday, October 27, 2026"; null if unavailable. */
+    fun currentDateText(): String? = null
 }
 
 interface SettingsNavigationTool {
@@ -49,4 +52,7 @@ interface NotificationReader {
 interface ReminderTool {
     /** Returns true only if the reminder was scheduled. */
     fun schedule(title: String, delayMinutes: Int): Boolean
+
+    /** User-facing reason the last [schedule] call returned false, if known. */
+    fun lastFailureReason(): String? = null
 }

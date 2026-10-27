@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
+import java.time.LocalDate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
@@ -33,4 +34,10 @@ class AndroidDeviceInfoTool(context: Context) : DeviceInfoTool {
 
     override fun currentTimeText(): String =
         LocalTime.now().format(DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT).withLocale(Locale.getDefault()))
+
+    override fun currentDateText(): String? = try {
+        LocalDate.now().format(DateTimeFormatter.ofLocalizedDate(FormatStyle.FULL).withLocale(Locale.getDefault()))
+    } catch (_: RuntimeException) {
+        null
+    }
 }

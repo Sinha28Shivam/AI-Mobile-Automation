@@ -1,9 +1,12 @@
 # Release build and installation
 
-> The release process below has **not yet been run end-to-end on a real device**.
-> Release signing reads the untracked `keystore.properties` (template:
-> `keystore.properties.example`); release builds use R8 (`isMinifyEnabled = true`,
-> `isShrinkResources = true`). These were added recently by integration work.
+> **Status (2026-10-27):** `assembleRelease` builds, and `scripts\verify-release.ps1` confirms
+> that the minified APK contains `libvosk.so` + `libjnidispatch.so` for all 4 ABIs and that R8
+> kept the Vosk/JNA classes. An OSV scan of the 113 release dependencies found no advisories.
+> A **signed** release APK has **not yet been installed on a device** (no release keystore is
+> configured yet), and in-place update and reinstall have not been tested. Release signing
+> reads the untracked `keystore.properties` (template: `keystore.properties.example`) or, in
+> CI, repository secrets. Release builds use R8 (`isMinifyEnabled = true`, `isShrinkResources = true`).
 
 ## 1. Debug vs release
 
@@ -70,9 +73,53 @@ Find the APK in `app\build\outputs\apk\release\`. Release builds are shrunk with
 the phone, since shrinking problems only show at runtime.
 
 Before each new release, increase `versionCode` (and `versionName`) in
-`app\build.gradle.kts` — currently `versionCode = 1`, `versionName = "0.1.0"`.
+`app\build.gradle.kts` — currently `versionCode = 1`, `versionName = "1.0.0"`.
 
-## 5. Verify the signature
+### Verify the release build locally
+
+```powershell
+.\scripts\verify-release.ps1             # runs assembleRelease, then checks
+.\scripts\verify-release.ps1 -SkipBuild  # only checks an existing APK
+```
+The script:
+1. checks that `libvosk.so` and `libjnidispatch.so` are packaged for every ABI
+   (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`);
+2. checks with `apkanalyzer` that R8 kept `org.vosk` / `com.sun.jna` classes;
+3. runs `apksigner verify` when the APK is signed, otherwise reports it as **UNSIGNED**;
+4. prints the SHA-256.
+
+It exits non-zero on any failed check and never prints signing secrets. A passing script
+does not prove the app works at runtime; still install the APK and run the regression
+checklist ([TEST_PLAN.md](TEST_PLAN.md) §2).
+
+## 5. CI release workflow (`.github/workflows/release.yml`)
+
+Runs on manual dispatch or when a `v*` tag is pushed. It uses the GitHub environment
+`release`; configure required reviewers on that environment so the signing secrets are
+protected. The Gradle cache is disabled for release builds.
+
+| Repository / environment secret | Content |
+|---|---|
+| `KEYSTORE_BASE64` | The `.jks` file, base64-encoded (`[Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\keys\jarvis-release.jks"))`) |
+| `KEYSTORE_PASSWORD` | Store password |
+| `KEY_ALIAS` | Key alias (e.g. `jarvis`) |
+| `KEY_PASSWORD` | Key password |
+
+Steps: when all four secrets exist, it decodes the keystore into `$RUNNER_TEMP`, writes a
+temporary `keystore.properties`, and runs `assembleRelease`. The signing material is then
+deleted (always). Next come the R8 smoke checks: native libraries for `arm64-v8a` and
+`armeabi-v7a`, plus `org.vosk.Model`, `Recognizer`, `LibVosk` and `com.sun.jna.Native`,
+`Pointer`, `Library` present in the dex. It then runs `apksigner verify` and uploads the
+APK, its `.sha256` and `mapping.txt` as artifacts.
+**Without the secrets** the workflow prints a warning and uploads an artifact labelled
+**UNSIGNED**, which Android will not install. It never prints the secret values.
+
+`.github/workflows/android-ci.yml` (PRs and `main`) covers unit tests, lint, debug and
+androidTest builds, and API 31 emulator tests. `.github/dependabot.yml` checks dependency
+updates weekly. No GitHub run of these workflows has been recorded yet; enable branch
+protection with the CI job as a required check before relying on it.
+
+## 6. Verify the signature
 
 `apksigner` is in the SDK build-tools:
 ```powershell
@@ -86,7 +133,7 @@ SHA-256 with:
 keytool -list -v -keystore C:\keys\jarvis-release.jks -alias jarvis
 ```
 
-## 6. SHA-256 checksum for release notes
+## 7. SHA-256 checksum for release notes
 
 ```powershell
 .\scripts\checksum.ps1
@@ -104,7 +151,7 @@ If PowerShell blocks the script ("running scripts is disabled"), run it for this
 powershell -ExecutionPolicy Bypass -File .\scripts\checksum.ps1
 ```
 
-## 7. Install on the Redmi Note 10S (Android 12 / MIUI)
+## 8. Install on the Redmi Note 10S (MIUI; the test device runs Android 13, MIUI V140)
 
 ### Option A — USB with adb (recommended)
 1. Enable Developer options, **USB debugging** and **Install via USB** (see README §3.5).
@@ -114,6 +161,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\checksum.ps1
    ```
 3. MIUI shows an **"Install via USB"** prompt on the phone — tap **Install** within ~10 seconds,
    otherwise the install fails with `INSTALL_FAILED_USER_RESTRICTED`.
+   If **Install via USB** is off, every adb install fails with that error, including
+   `connectedDebugAndroidTest` (which installs a second test APK). This currently blocks
+   the instrumentation run on the test Redmi.
 
 ### Option B — copy the file
 1. Connect by USB in **File transfer** mode and copy the APK to `Download\`
@@ -127,15 +177,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\checksum.ps1
 Installing an APK manually does **not** grant any permissions: JARVIS still asks for the
 microphone at first Start, and notification access must still be enabled manually.
 
-## 8. Updating
+## 9. Updating
 - Build a new APK with a higher `versionCode`, signed with the **same** release key.
 - Install over the existing app: `adb install -r ...` or open the new APK on the phone.
   App data (settings, history, downloaded model) is kept.
 - `INSTALL_FAILED_UPDATE_INCOMPATIBLE` means a different signing key — uninstall first (data is lost).
 - `INSTALL_FAILED_VERSION_DOWNGRADE` means the `versionCode` is lower than the installed one.
 
-## 9. Uninstall
+## 10. Uninstall
 - Phone: long-press JARVIS → **Uninstall**, or Settings → Apps → Manage apps → JARVIS → Uninstall.
 - PC: `adb uninstall com.jarvis.assistant`
 
-Uninstalling removes all app data: settings, history and the speech model.
+Uninstalling removes all app data: settings, history, saved reminders and the speech model.

@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -33,8 +34,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jarvis.assistant.ai.ModelState
 import com.jarvis.assistant.permissions.PermissionManager
+import com.jarvis.assistant.service.ErrorRecovery
 import com.jarvis.assistant.service.LastExchange
+import com.jarvis.assistant.service.LatencyStats
 import com.jarvis.assistant.service.ServiceState
+import com.jarvis.assistant.service.VoiceMetricsSnapshot
 import com.jarvis.assistant.tts.SpeechOutput
 
 @Composable
@@ -45,6 +49,7 @@ fun HomeScreen(
     historyEnabled: Boolean,
     lastExchange: LastExchange?,
     notice: String?,
+    diagnostics: VoiceMetricsSnapshot,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onTapToTalk: () -> Unit,
@@ -52,6 +57,7 @@ fun HomeScreen(
     onWakeSensitivityChange: (Float) -> Unit,
     onOpenModelSetup: () -> Unit,
     onOpenSettings: () -> Unit,
+    onDismissError: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -103,7 +109,13 @@ fun HomeScreen(
                 onClick = onStop,
                 modifier = Modifier.fillMaxWidth().height(96.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-            ) { Text("Stop Listening", fontSize = 22.sp) }
+            ) { Text(if (state == ServiceState.Starting) "Cancel start" else "Stop Listening", fontSize = 22.sp) }
+        } else if (state == ServiceState.Stopping) {
+            Button(
+                onClick = {},
+                enabled = false,
+                modifier = Modifier.fillMaxWidth().height(96.dp),
+            ) { Text("Stopping…", fontSize = 22.sp) }
         } else {
             Button(
                 onClick = { withPermissions(tapToTalk = false, action = onStart) },
@@ -114,18 +126,63 @@ fun HomeScreen(
         Spacer(Modifier.height(12.dp))
         OutlinedButton(
             onClick = { withPermissions(tapToTalk = true, action = onTapToTalk) },
-            enabled = modelReady && (state == ServiceState.Listening || !state.isActive),
+            enabled = modelReady && (state == ServiceState.Listening || (!state.isActive && state != ServiceState.Stopping)),
             modifier = Modifier.fillMaxWidth().height(56.dp),
         ) { Text("Tap to talk") }
 
         Spacer(Modifier.height(24.dp))
-        Text("Status: ${state.label}", style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+        Text("Status: ${statusText(state)}", style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+
+        if (state == ServiceState.MicrophoneSilenced) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Another app (for example a call or voice recorder) is using the microphone. " +
+                    "JARVIS will resume automatically when it is free.",
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = TextAlign.Center,
+            )
+        }
+
+        if (state is ServiceState.Error) {
+            ErrorRecoveryActions(
+                state = state,
+                onRetry = { onDismissError(); withPermissions(tapToTalk = false, action = onStart) },
+                onOpenAppSettings = {
+                    onDismissError()
+                    try {
+                        context.startActivity(PermissionManager.appSettingsIntent(context))
+                    } catch (_: ActivityNotFoundException) {
+                        // No settings app available; nothing else to do.
+                    }
+                },
+                onOpenModelSetup = onOpenModelSetup,
+                onDismiss = onDismissError,
+            )
+        }
+
+        if (!PermissionManager.hasNotificationPermission(context)) {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "Notifications are off for JARVIS. Listening still works, but the status notification " +
+                    "(with its Stop button) and reminder alerts may be hidden. Use the Stop button here, " +
+                    "or allow notifications in app settings.",
+                style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center,
+            )
+            TextButton(onClick = {
+                try {
+                    context.startActivity(PermissionManager.appSettingsIntent(context))
+                } catch (_: ActivityNotFoundException) {
+                    // No settings app available; nothing else to do.
+                }
+            }) { Text("Allow notifications") }
+        }
 
         if (!modelReady) {
             Spacer(Modifier.height(12.dp))
             Text(
                 when (modelState) {
-                    is ModelState.Downloading, ModelState.Verifying -> "Speech model is being installedâ€¦"
+                    is ModelState.Downloading, ModelState.Verifying -> "Speech model is being installed..."
                     is ModelState.Error -> "Speech model problem: ${modelState.message}"
                     else -> "Speech model not installed. Set it up to start listening."
                 },
@@ -175,8 +232,74 @@ fun HomeScreen(
         OutlinedButton(onClick = onOpenModelSetup) { Text("Speech model") }
         Spacer(Modifier.height(8.dp))
         OutlinedButton(onClick = onOpenSettings) { Text("Settings & help") }
+
+        Spacer(Modifier.height(24.dp))
+        Diagnostics(diagnostics)
     }
 }
+
+private fun statusText(state: ServiceState): String = when (state) {
+    is ServiceState.Error -> "Error"
+    else -> state.label
+}
+
+@Composable
+private fun ErrorRecoveryActions(
+    state: ServiceState.Error,
+    onRetry: () -> Unit,
+    onOpenAppSettings: () -> Unit,
+    onOpenModelSetup: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Spacer(Modifier.height(8.dp))
+    Text(
+        state.message,
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.error,
+        textAlign = TextAlign.Center,
+    )
+    Spacer(Modifier.height(8.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        when (state.recovery) {
+            ErrorRecovery.Retry -> Button(onClick = onRetry) { Text("Try again") }
+            ErrorRecovery.OpenAppSettings -> Button(onClick = onOpenAppSettings) { Text("Open app settings") }
+            ErrorRecovery.OpenModelSetup -> Button(onClick = onOpenModelSetup) { Text("Set up speech model") }
+        }
+        TextButton(onClick = onDismiss) { Text("Dismiss") }
+    }
+}
+
+/** On-device counters only (no transcripts); reset when the app process restarts. */
+@Composable
+private fun Diagnostics(snapshot: VoiceMetricsSnapshot) {
+    var expanded by remember { mutableStateOf(false) }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        TextButton(onClick = { expanded = !expanded }) {
+            Text(if (expanded) "Hide diagnostics" else "Show diagnostics")
+        }
+        if (!expanded) return@Column
+        val style = MaterialTheme.typography.bodySmall
+        Text("Counts since app start (no speech content is stored).", style = style)
+        Text("Wake detections: ${snapshot.wakeDetections}   Tap-to-talk: ${snapshot.tapToTalkSessions}", style = style)
+        Text("Command sessions: ${snapshot.commandSessions}", style = style)
+        Text(
+            "No speech: ${snapshot.noSpeech}   Low confidence: ${snapshot.lowConfidence}   " +
+                "Handler errors: ${snapshot.handlerFailures}",
+            style = style,
+        )
+        Text(
+            "Voice output failures: ${snapshot.speechOutputFailures}   Mic errors: ${snapshot.captureErrors}   " +
+                "Mic taken by other app: ${snapshot.microphoneSilenced}",
+            style = style,
+        )
+        Text("Model load: ${snapshot.lastModelLoadMs?.let { "$it ms" } ?: "n/a"}", style = style)
+        Text("Wake to command start: ${latency(snapshot.wakeLatency)}", style = style)
+        Text("End of speech to reply: ${latency(snapshot.responseLatency)}", style = style)
+    }
+}
+
+private fun latency(stats: LatencyStats): String =
+    if (stats.count == 0) "n/a" else "avg ${stats.averageMs} / median ${stats.medianMs} / p95 ${stats.p95Ms} ms (n=${stats.count})"
 
 @Composable
 private fun WakeSensitivity(value: Float, onChange: (Float) -> Unit) {

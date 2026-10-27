@@ -134,6 +134,82 @@ class ModelArchiveTest {
         ModelArchive.extract(ByteArrayInputStream(zip), tmp.newFolder("out"), maxTotalBytes = 1_000, maxEntries = 2)
     }
 
+    @Test
+    fun rejectsWindowsAndEncodedTraversalForms() {
+        assertUnsafe("C:\\Windows\\evil.dll")
+        assertUnsafe("c:evil.dll")
+        assertUnsafe("\\\\server\\share\\evil")
+        assertUnsafe("\\evil.txt")
+        assertUnsafe("model\\..\\..\\evil.txt")
+        assertUnsafe("model/file:stream")
+        assertUnsafe("model/\u0000evil")
+        assertUnsafe("a/".repeat(300))
+    }
+
+    @Test
+    fun rejectsSiblingPrefixWithBackslashes() {
+        val dest = File(tmp.root, "vosk").apply { mkdirs() }
+        File(tmp.root, "vosk-evil").mkdirs()
+        try {
+            ModelArchive.resolveEntry(dest, "..\\vosk-evil\\x")
+            fail("sibling prefix must be rejected")
+        } catch (e: ModelArchiveException) {
+            // expected
+        }
+    }
+
+    @Test
+    fun symlinkLikeEntryIsWrittenAsPlainFileInsideDestination() {
+        // Unix zip symlinks store the link target as the entry's data; ZipInputStream has no
+        // symlink support, so it must land as a regular file and never redirect later writes.
+        val zip = zipOf("m/link" to "../../outside".toByteArray(), "m/after.txt" to "a".toByteArray())
+        val dest = tmp.newFolder("out")
+        ModelArchive.extract(ByteArrayInputStream(zip), dest, maxTotalBytes = 1_000)
+        val link = File(dest, "m/link")
+        assertTrue(link.isFile)
+        assertEquals("../../outside", link.readText())
+        assertTrue(File(dest, "m/after.txt").isFile)
+        assertTrue(!File(tmp.root, "outside").exists())
+    }
+
+    @Test(expected = ModelArchiveException::class)
+    fun extractRejectsDuplicateEntries() {
+        val bytes = ByteArrayOutputStream()
+        // ZipOutputStream refuses duplicate names, so write two equivalent paths.
+        ZipOutputStream(bytes).use { zip ->
+            zip.putNextEntry(ZipEntry("m/a.txt")); zip.write(1); zip.closeEntry()
+            zip.putNextEntry(ZipEntry("m/./a.txt")); zip.write(2); zip.closeEntry()
+        }
+        ModelArchive.extract(ByteArrayInputStream(bytes.toByteArray()), tmp.newFolder("out"), maxTotalBytes = 1_000)
+    }
+
+    @Test
+    fun extractHonoursCancellation() {
+        val zip = zipOf("a" to byteArrayOf(1), "b" to byteArrayOf(1))
+        var calls = 0
+        try {
+            ModelArchive.extract(ByteArrayInputStream(zip), tmp.newFolder("out"), maxTotalBytes = 1_000, checkCancelled = {
+                if (++calls == 2) throw java.util.concurrent.CancellationException()
+            })
+            fail("expected cancellation")
+        } catch (e: java.util.concurrent.CancellationException) {
+            // expected
+        }
+    }
+
+    @Test
+    fun copyAndDigestReportsMd5AndSize() {
+        val d = ModelArchive.copyAndDigest(ByteArrayInputStream("abc".toByteArray()), ByteArrayOutputStream())
+        assertEquals("900150983cd24fb0d6963f7d28e17f72", d.md5)
+        assertEquals(3L, d.sizeBytes)
+        assertEquals(d, ModelArchive.digestFile(tmp.newFile("y.bin").apply { writeBytes("abc".toByteArray()) }))
+    }
+
+    @Test(expected = ModelArchiveException::class)
+    fun extractRejectsNonZipData() {
+        ModelArchive.extract(ByteArrayInputStream("this is not a zip".toByteArray()), tmp.newFolder("out"), maxTotalBytes = 1_000)
+    }
+
     @Test(expected = ModelArchiveException::class)
     fun extractRejectsEmptyArchive() {
         ModelArchive.extract(ByteArrayInputStream(ByteArray(0)), tmp.newFolder("out"), maxTotalBytes = 1_000)

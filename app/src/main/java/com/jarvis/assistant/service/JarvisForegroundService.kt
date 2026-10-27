@@ -1,5 +1,7 @@
 package com.jarvis.assistant.service
 
+import android.annotation.SuppressLint
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,11 +11,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.jarvis.assistant.MainActivity
@@ -23,16 +25,12 @@ import com.jarvis.assistant.data.PreferencesRepository
 import com.jarvis.assistant.permissions.PermissionManager
 import com.jarvis.assistant.speech.LocalSpeechEngineAdapter
 import com.jarvis.assistant.wakeword.VoskKeywordWakeWordDetector
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.vosk.LibVosk
@@ -40,75 +38,128 @@ import org.vosk.LogLevel
 import org.vosk.Model
 
 /**
- * Owns the lifecycle of active microphone listening. Started only from a
- * visible user action; shows a persistent notification with a Stop action.
+ * Foreground service hosting active microphone listening. Started only from a visible
+ * user action (Start / Tap to talk in the app, or the Talk/Stop actions of its own
+ * notification). There is no BOOT_COMPLETED receiver: listening never auto-starts after
+ * reboot, and `START_NOT_STICKY` means Android does not restart it after the process is
+ * killed or the app is force-stopped.
  *
- * On start it loads the local Vosk model (off the main thread), then wires
- * AudioCaptureController (the single mic owner) -> [VoicePipeline]. Without an
- * installed model it reports an error instead of listening.
+ * Resource ownership (each resource has exactly one owner and is released exactly once):
+ *
+ * | Resource                          | Owner                                   | Released                                                    |
+ * |-----------------------------------|-----------------------------------------|-------------------------------------------------------------|
+ * | Session lifecycle / generation    | [ListeningSessionController]            | `stop()` / `stopAndJoin()`; Stopped only after full release |
+ * | `AudioRecord` + read coroutine    | [AudioCaptureController] (one/session)  | after the read loop exits (`stopAndJoin`)                   |
+ * | [VoicePipeline] + its coroutine   | the session (new instance per session)  | `VoicePipeline.stopAndJoin()`                               |
+ * | Vosk wake + command `Recognizer`s | the pipeline's consumer coroutine       | its completion handler, after the last use                  |
+ * | Shared Vosk `Model`               | the session's `LoadResult.Ready`        | `onClose`, after recognizers were freed                     |
+ * | TTS speaker, command handler      | the session (fresh from [VoicePipelineConfig]) | `onClose` (if `AutoCloseable`)                        |
+ * | Foreground notification           | this service                            | `onIdle` -> stopForeground + stopSelf, or onDestroy         |
+ *
+ * onTaskRemoved: swiping the app from Recents does not stop listening (the foreground
+ * notification keeps it visible and stoppable); the default behaviour is kept on purpose.
+ * onDestroy stops any session; teardown runs to completion on a background scope.
  */
 class JarvisForegroundService : Service() {
 
-    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val preferences by lazy { PreferencesRepository(this) }
-
-    private var audioCapture: AudioCaptureController? = null
-    private var pipeline: VoicePipeline? = null
-    private var startupJob: Job? = null
-    private var settingsJob: Job? = null
-    private var pendingTapToTalk = false
+    private var observerJob: Job? = null
+    private var inForeground = false
 
     @Volatile
     private var historyEnabled = false
 
+    @Volatile
+    private var talkUnavailableNotice = false
+
+    private val controller by lazy {
+        ListeningSessionController(
+            scope = serviceScope,
+            backgroundDispatcher = Dispatchers.IO,
+            store = ServiceStateRepository,
+            hasMicrophonePermission = { PermissionManager.hasMicrophonePermission(this) },
+            loader = { loadPipeline(it) },
+            captureFactory = { onError, onSilenced ->
+                AudioCaptureController(
+                    source = AndroidAudioRecordSource(this),
+                    onError = onError,
+                    onSilencedChanged = onSilenced,
+                )
+            },
+            onIdle = ::stopForegroundAndSelf,
+            clock = SystemClock::elapsedRealtime,
+            metrics = VoiceMetrics.shared,
+            priorTeardown = lastServiceTeardown,
+        )
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action
-        if (action == ACTION_STOP) {
-            stopListening()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> controller.stop()
+            ACTION_NOTIFICATION_TALK -> onNotificationTalk()
+            else -> onStartRequest(tapToTalk = intent?.action == ACTION_TAP_TO_TALK)
         }
+        return START_NOT_STICKY
+    }
 
-        val tapToTalk = action == ACTION_TAP_TO_TALK
-        if (pipeline != null || startupJob?.isActive == true) {
-            // Already running in the foreground. Re-post the notification in case this arrived via
-            // startForegroundService, which requires a startForeground call for every start.
-            try {
-                ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), foregroundType())
-            } catch (e: Exception) {
-                Log.w(TAG, "startForeground refresh failed: ${e.javaClass.simpleName}")
-            }
-            if (tapToTalk) {
-                val running = pipeline
-                if (running != null) running.requestTapToTalk() else pendingTapToTalk = true
-            }
-            return START_NOT_STICKY
+    private fun onStartRequest(tapToTalk: Boolean) {
+        // Started via startForegroundService: startForeground must be called for every start.
+        if (!enterForeground()) return
+        val outcome = controller.start(tapToTalk)
+        if (outcome == ListeningSessionController.StartOutcome.PermissionMissing) {
+            stopForegroundAndSelf()
+            return
         }
-
-        if (!PermissionManager.hasMicrophonePermission(this)) {
-            ServiceStateRepository.update(ServiceState.PermissionRequired)
-            stopSelf()
-            return START_NOT_STICKY
+        if (outcome == ListeningSessionController.StartOutcome.Started) {
+            ServiceNoticeRepository.clear()
+            observeWhileRunning()
         }
+    }
 
+    private fun onNotificationTalk() {
+        // Delivered with plain startService from our own notification: only valid while listening.
+        if (controller.isIdle) {
+            stopForegroundAndSelf()
+            return
+        }
+        talkUnavailableNotice = !controller.requestTapToTalk(fromNotification = true)
+        updateNotification(ServiceStateRepository.state.value)
+    }
+
+    /** Returns false (with an Error state) if Android refuses foreground start. */
+    private fun enterForeground(): Boolean {
         createNotificationChannel()
         try {
-            ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), foregroundType())
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                buildNotification(ServiceStateRepository.state.value),
+                foregroundType(),
+            )
+            inForeground = true
+            return true
         } catch (e: Exception) {
-            // e.g. ForegroundServiceStartNotAllowedException or SecurityException on newer APIs.
+            val message = when {
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && e is ForegroundServiceStartNotAllowedException ->
+                    MSG_FGS_NOT_ALLOWED
+                e is SecurityException -> MSG_FGS_SECURITY
+                else -> MSG_FGS_FAILED
+            }
             Log.w(TAG, "startForeground failed: ${e.javaClass.simpleName}")
-            ServiceStateRepository.update(ServiceState.Error("Could not start listening service"))
-            stopSelf()
-            return START_NOT_STICKY
+            if (controller.isIdle) {
+                ServiceStateRepository.update(
+                    ServiceState.Error(
+                        message,
+                        if (e is SecurityException) ErrorRecovery.OpenAppSettings else ErrorRecovery.Retry,
+                    ),
+                )
+                stopSelf()
+            }
+            return false
         }
-
-        pendingTapToTalk = tapToTalk
-        ServiceNoticeRepository.clear()
-        ServiceStateRepository.update(ServiceState.Starting)
-        startupJob = serviceScope.launch { startPipeline() }
-        return START_NOT_STICKY
     }
 
     private fun foregroundType(): Int =
@@ -119,81 +170,54 @@ class JarvisForegroundService : Service() {
             0
         }
 
-    private suspend fun startPipeline() {
+    private fun observeWhileRunning() {
+        if (observerJob?.isActive == true) return
+        observerJob = serviceScope.launch {
+            launch {
+                preferences.settings.collect { settings ->
+                    historyEnabled = settings.historyEnabled
+                    if (!settings.historyEnabled) LastExchangeRepository.clear()
+                    controller.setWakeSensitivity(settings.wakeSensitivity)
+                }
+            }
+            launch {
+                ServiceStateRepository.state.collect { state ->
+                    // A "Talk unavailable" hint lasts until the next real state change.
+                    talkUnavailableNotice = false
+                    updateNotification(state)
+                }
+            }
+        }
+    }
+
+    private suspend fun loadPipeline(callbacks: PipelineCallbacks): LoadResult {
         val settings = preferences.settings.first()
         historyEnabled = settings.historyEnabled
-
-        // withContext rethrows cancellation on return even for NonCancellable blocks, so keep a
-        // handle to close the native model if Stop arrives while it is loading.
-        var loadedModel: Model? = null
-        val load = try {
-            withContext(Dispatchers.IO + NonCancellable) {
-                loadModel().also { if (it is ModelLoad.Loaded) loadedModel = it.model }
-            }
-        } catch (e: CancellationException) {
-            loadedModel?.close()
-            throw e
+        val dir = LocalModelManager.get(this).installedModelDir()
+            ?: return LoadResult.Failed(MODEL_MISSING_MESSAGE, ErrorRecovery.OpenModelSetup)
+        val model = try {
+            LibVosk.setLogLevel(LogLevel.WARNINGS)
+            Model(dir.absolutePath)
+        } catch (e: Exception) {
+            Log.w(TAG, "Speech model load failed: ${e.javaClass.simpleName}")
+            return LoadResult.Failed(MSG_MODEL_LOAD_FAILED, ErrorRecovery.OpenModelSetup)
+        } catch (e: UnsatisfiedLinkError) {
+            Log.w(TAG, "Speech engine native library unavailable")
+            return LoadResult.Failed("Speech engine is not supported on this device.", ErrorRecovery.OpenModelSetup)
+        } catch (e: OutOfMemoryError) {
+            Log.w(TAG, "Out of memory while loading speech model")
+            return LoadResult.Failed("Not enough memory to load the speech model. Close other apps and tap Start.")
         }
-        val model = when (load) {
-            ModelLoad.Missing -> {
-                failAndStop(MODEL_MISSING_MESSAGE)
-                return
-            }
-            is ModelLoad.Failed -> {
-                failAndStop(load.message)
-                return
-            }
-            is ModelLoad.Loaded -> load.model
-        }
-        if (!currentCoroutineContext().isActive || !ServiceStateRepository.state.value.isActive) {
-            model.close()
-            return
-        }
-
-        val pipeline = try {
-            buildPipeline(model, settings.wakeSensitivity)
+        return try {
+            buildPipeline(model, settings.wakeSensitivity, callbacks)
         } catch (e: Exception) {
             Log.w(TAG, "Recognizer init failed: ${e.javaClass.simpleName}")
             model.close()
-            failAndStop("Speech recognizer could not be started")
-            return
-        }
-        this.pipeline = pipeline
-        pipeline.start()
-        observeSettings(pipeline)
-
-        if (!startCapture(pipeline)) return
-        ServiceStateRepository.updateIfActive(ServiceState.Listening)
-        if (pendingTapToTalk) {
-            pendingTapToTalk = false
-            pipeline.requestTapToTalk()
+            LoadResult.Failed(ListeningSessionController.MSG_LOAD_FAILED)
         }
     }
 
-    private sealed interface ModelLoad {
-        data object Missing : ModelLoad
-        data class Failed(val message: String) : ModelLoad
-        class Loaded(val model: Model) : ModelLoad
-    }
-
-    private fun loadModel(): ModelLoad {
-        val dir = LocalModelManager.get(this).installedModelDir() ?: return ModelLoad.Missing
-        return try {
-            LibVosk.setLogLevel(LogLevel.WARNINGS)
-            ModelLoad.Loaded(Model(dir.absolutePath))
-        } catch (e: Exception) {
-            Log.w(TAG, "Speech model load failed: ${e.javaClass.simpleName}")
-            ModelLoad.Failed("Speech model could not be loaded")
-        } catch (e: UnsatisfiedLinkError) {
-            Log.w(TAG, "Speech engine native library unavailable")
-            ModelLoad.Failed("Speech engine is not supported on this device")
-        } catch (e: OutOfMemoryError) {
-            Log.w(TAG, "Out of memory while loading speech model")
-            ModelLoad.Failed("Not enough memory to load the speech model")
-        }
-    }
-
-    private fun buildPipeline(model: Model, sensitivity: Float): VoicePipeline {
+    private suspend fun buildPipeline(model: Model, sensitivity: Float, callbacks: PipelineCallbacks): LoadResult.Ready {
         val sampleRate = AudioCaptureController.SAMPLE_RATE
         val detector = VoskKeywordWakeWordDetector(model, sampleRate, initialSensitivity = sensitivity)
         val engine = try {
@@ -202,92 +226,46 @@ class JarvisForegroundService : Service() {
             detector.release()
             throw e
         }
-        val handler = VoicePipelineConfig.commandHandlerProvider(applicationContext)
-        val speaker = VoicePipelineConfig.speakerProvider(applicationContext)
-        return VoicePipeline(
+        // Providers (e.g. TextToSpeech) expect the main thread, as before.
+        val (handler, speaker) = withContext(Dispatchers.Main) {
+            VoicePipelineConfig.commandHandlerProvider(applicationContext) to
+                VoicePipelineConfig.speakerProvider(applicationContext)
+        }
+        val pipeline = VoicePipeline(
             wakeWord = detector,
             speechToText = engine,
             commandHandler = handler,
             speaker = speaker,
-            onStopRequested = { mainHandler.post { stopListening() } },
+            onStopRequested = callbacks.onStopRequested,
             onExchange = { command, reply ->
                 if (historyEnabled) LastExchangeRepository.set(LastExchange(command, reply))
             },
-            onReleased = {
-                // Recognizers are freed first by the pipeline; only then is the shared model freed.
-                model.close()
-                closeQuietly(handler)
-                closeQuietly(speaker)
-            },
+            setState = callbacks.setState,
+            metrics = callbacks.metrics,
         )
-    }
-
-    private fun observeSettings(pipeline: VoicePipeline) {
-        settingsJob?.cancel()
-        settingsJob = serviceScope.launch {
-            preferences.settings.collect { settings ->
-                historyEnabled = settings.historyEnabled
-                if (!settings.historyEnabled) LastExchangeRepository.clear()
-                pipeline.setWakeSensitivity(settings.wakeSensitivity)
-            }
+        // Runs after the pipeline has released both recognizers, so the shared model is freed last.
+        return LoadResult.Ready(pipeline) {
+            model.close()
+            closeQuietly(handler)
+            closeQuietly(speaker)
         }
     }
 
-    private fun startCapture(pipeline: VoicePipeline): Boolean {
-        val controller = AudioCaptureController(onError = ::onCaptureError)
-        audioCapture = controller
-        controller.addFrameListener(pipeline::offerFrame)
-        val started = try {
-            controller.start()
-        } catch (e: SecurityException) {
-            onCaptureError("Microphone permission denied")
-            false
+    private fun stopForegroundAndSelf() {
+        observerJob?.cancel()
+        observerJob = null
+        if (inForeground) {
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            inForeground = false
         }
-        if (!started && ServiceStateRepository.state.value !is ServiceState.Error) {
-            onCaptureError("Microphone unavailable")
-        }
-        return started
-    }
-
-    private fun failAndStop(message: String) {
-        ServiceStateRepository.update(ServiceState.Error(message))
-        releaseAndStop(resetState = false)
-    }
-
-    /** May be invoked from the capture thread; teardown is marshalled to the main thread. */
-    private fun onCaptureError(message: String) {
-        ServiceStateRepository.update(ServiceState.Error(message))
-        mainHandler.post { releaseAndStop(resetState = false) }
-    }
-
-    private fun stopListening() {
-        releaseAndStop(resetState = true)
-    }
-
-    private fun releaseResources() {
-        startupJob?.cancel()
-        startupJob = null
-        settingsJob?.cancel()
-        settingsJob = null
-        pendingTapToTalk = false
-        audioCapture?.release()
-        audioCapture = null
-        pipeline?.stop()
-        pipeline = null
-    }
-
-    private fun releaseAndStop(resetState: Boolean) {
-        if (resetState) ServiceStateRepository.update(ServiceState.Stopped)
-        releaseResources()
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     override fun onDestroy() {
-        if (ServiceStateRepository.state.value.isActive) {
-            ServiceStateRepository.update(ServiceState.Stopped)
-        }
-        releaseResources()
+        // Teardown continues on the controller's background scope and ends in Stopped.
+        controller.stop()
+        // A new service instance must not open the mic before this one has released it.
+        lastServiceTeardown = controller.pendingTeardown
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -313,7 +291,18 @@ class JarvisForegroundService : Service() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
-    private fun buildNotification(): Notification {
+    @SuppressLint("MissingPermission") // Checked via PermissionManager.hasNotificationPermission below.
+    private fun updateNotification(state: ServiceState) {
+        if (!inForeground || !state.isActive) return
+        if (!PermissionManager.hasNotificationPermission(this)) return
+        try {
+            NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, buildNotification(state))
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Notification update not permitted")
+        }
+    }
+
+    private fun buildNotification(state: ServiceState): Notification {
         val openApp = PendingIntent.getActivity(
             this,
             0,
@@ -329,21 +318,26 @@ class JarvisForegroundService : Service() {
         val talk = PendingIntent.getService(
             this,
             2,
-            Intent(this, JarvisForegroundService::class.java).setAction(ACTION_TAP_TO_TALK),
+            Intent(this, JarvisForegroundService::class.java).setAction(ACTION_NOTIFICATION_TALK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val text = when {
+            talkUnavailableNotice -> "Talk is available only while JARVIS is listening for the wake word."
+            state.isActive && state != ServiceState.Starting -> "${state.label}. Audio stays on this device and is never saved."
+            else -> getString(R.string.notification_text)
+        }
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_mic)
             .setContentTitle(getString(R.string.notification_title))
-            .setContentText(getString(R.string.notification_text))
+            .setContentText(text)
             .setContentIntent(openApp)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .setSilent(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .addAction(0, getString(R.string.notification_action_talk), talk)
-            .addAction(0, getString(R.string.notification_action_stop), stop)
-            .build()
+        if (state == ServiceState.Listening) builder.addAction(0, getString(R.string.notification_action_talk), talk)
+        return builder.addAction(0, getString(R.string.notification_action_stop), stop).build()
     }
 
     companion object {
@@ -353,18 +347,39 @@ class JarvisForegroundService : Service() {
         const val ACTION_START = "com.jarvis.assistant.action.START"
         const val ACTION_STOP = "com.jarvis.assistant.action.STOP"
         const val ACTION_TAP_TO_TALK = "com.jarvis.assistant.action.TAP_TO_TALK"
+        private const val ACTION_NOTIFICATION_TALK = "com.jarvis.assistant.action.NOTIFICATION_TALK"
         const val MODEL_MISSING_MESSAGE = "Speech model not installed"
+        const val MSG_MODEL_LOAD_FAILED = "Speech model could not be loaded. Reinstall it from Speech model setup."
+        const val MSG_FGS_NOT_ALLOWED =
+            "Android blocked listening from starting in the background. Open JARVIS and tap Start."
+        const val MSG_FGS_SECURITY = "Android denied microphone access for the listening service. Check permissions."
+        const val MSG_FGS_FAILED = "Could not start the listening service. Tap Start to try again."
+
+        @Volatile
+        private var lastServiceTeardown: Job? = null
 
         /** Must be called from a visible activity / user action. */
         fun start(context: Context) {
-            val intent = Intent(context, JarvisForegroundService::class.java).setAction(ACTION_START)
-            ContextCompat.startForegroundService(context, intent)
+            startFromUi(context, ACTION_START)
         }
 
         /** Captures one command immediately, starting the service first if needed. User action only. */
         fun tapToTalk(context: Context) {
-            val intent = Intent(context, JarvisForegroundService::class.java).setAction(ACTION_TAP_TO_TALK)
-            ContextCompat.startForegroundService(context, intent)
+            startFromUi(context, ACTION_TAP_TO_TALK)
+        }
+
+        private fun startFromUi(context: Context, action: String) {
+            val intent = Intent(context, JarvisForegroundService::class.java).setAction(action)
+            try {
+                ContextCompat.startForegroundService(context, intent)
+            } catch (e: IllegalStateException) {
+                // Includes ForegroundServiceStartNotAllowedException (API 31+) when not in the foreground.
+                Log.w(TAG, "startForegroundService refused: ${e.javaClass.simpleName}")
+                ServiceStateRepository.update(ServiceState.Error(MSG_FGS_NOT_ALLOWED))
+            } catch (e: SecurityException) {
+                Log.w(TAG, "startForegroundService denied")
+                ServiceStateRepository.update(ServiceState.Error(MSG_FGS_SECURITY, ErrorRecovery.OpenAppSettings))
+            }
         }
 
         fun stop(context: Context) {

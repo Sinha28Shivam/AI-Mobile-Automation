@@ -1,12 +1,6 @@
 package com.jarvis.assistant.service
 
-import android.Manifest
-import android.annotation.SuppressLint
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.util.Log
-import androidx.annotation.RequiresPermission
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -21,26 +15,36 @@ import java.util.concurrent.CopyOnWriteArrayList
 typealias AudioFrameListener = (frame: ShortArray, length: Int) -> Unit
 
 /**
- * Sole owner of [AudioRecord] while JARVIS is listening.
+ * Sole owner of the microphone ([AudioSource]) for one listening session.
  *
- * Captures 16 kHz mono PCM16 on a background dispatcher and delivers frames
- * to registered listeners via [addFrameListener]. Frames are only held in
- * memory and the buffer is reused; nothing is ever persisted. Listeners are
- * invoked on the capture thread and must return quickly (copy the data if it
- * must outlive the callback). Later pipeline stages (wake word, STT) plug in
- * by registering a listener.
+ * Single use: [start] opens the source once; [stopAndJoin] (or [stop]) ends the
+ * session and the instance cannot be restarted (create a new one per session).
+ * Frames are read on [dispatcher] and delivered to listeners on that thread;
+ * the buffer is reused and never persisted. The source is released exactly once,
+ * after the read loop has exited, so release never races an in-flight read.
+ *
+ * [onError] fires at most once, only for unexpected failures (not after Stop).
  */
 class AudioCaptureController(
+    private val source: AudioSource,
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
-    private val onError: (String) -> Unit = {},
+    private val onError: (message: String, recovery: ErrorRecovery) -> Unit = { _, _ -> },
+    private val onSilencedChanged: (Boolean) -> Unit = {},
 ) {
+    private enum class Phase { New, Running, Stopped }
+
     private val listeners = CopyOnWriteArrayList<AudioFrameListener>()
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
+    private val lock = Any()
+    private var phase = Phase.New
     private var captureJob: Job? = null
-    private var audioRecord: AudioRecord? = null
+    private var released = false
+
+    @Volatile
+    private var errorReported = false
 
     val isCapturing: Boolean
-        @Synchronized get() = captureJob?.isActive == true
+        get() = synchronized(lock) { phase == Phase.Running && captureJob?.isActive == true }
 
     fun addFrameListener(listener: AudioFrameListener) {
         listeners.addIfAbsent(listener)
@@ -50,68 +54,65 @@ class AudioCaptureController(
         listeners.remove(listener)
     }
 
-    /** Starts capture. Returns false (and reports via onError) if the mic cannot be opened. */
-    @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    @Synchronized
+    /**
+     * Opens the microphone and starts the read loop. Returns true if capturing. A second call
+     * while running is a no-op returning true; calling after stop returns false.
+     */
     fun start(): Boolean {
-        if (captureJob?.isActive == true) return true
-
-        val minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
-        if (minBuffer <= 0) {
-            onError("Microphone configuration not supported")
-            return false
+        synchronized(lock) {
+            when (phase) {
+                Phase.Running -> return true
+                Phase.Stopped -> return false
+                Phase.New -> phase = Phase.Running
+            }
         }
-        val bufferBytes = maxOf(minBuffer, FRAME_SAMPLES * BYTES_PER_SAMPLE * 4)
-
-        val record = try {
-            createAudioRecord(bufferBytes)
+        source.onSilencedChanged = { silenced -> if (synchronized(lock) { phase == Phase.Running }) onSilencedChanged(silenced) }
+        val result = try {
+            source.start()
         } catch (e: SecurityException) {
-            onError("Microphone permission denied")
-            return false
-        } catch (e: IllegalArgumentException) {
-            onError("Microphone unavailable")
+            AudioStartResult.Failed(CaptureErrors.PERMISSION_DENIED, ErrorRecovery.OpenAppSettings)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Audio source start failed: ${e.javaClass.simpleName}")
+            AudioStartResult.Failed(CaptureErrors.INIT_FAILED)
+        }
+        if (result is AudioStartResult.Failed) {
+            synchronized(lock) { phase = Phase.Stopped }
+            releaseSourceOnce()
+            scope.cancel()
+            reportError(result.message, result.recovery)
             return false
         }
-
-        if (record.state != AudioRecord.STATE_INITIALIZED) {
-            record.release()
-            onError("Microphone could not be initialized (in use by another app?)")
-            return false
+        synchronized(lock) {
+            if (phase != Phase.Running) {
+                // Stopped concurrently while the source was opening.
+                releaseSourceOnce()
+                return false
+            }
+            val job = scope.launch { readLoop() }
+            job.invokeOnCompletion { releaseSourceOnce() }
+            captureJob = job
         }
-
-        try {
-            record.startRecording()
-        } catch (e: IllegalStateException) {
-            record.release()
-            onError("Microphone could not start recording")
-            return false
-        }
-        if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-            record.release()
-            onError("Microphone is in use by another app")
-            return false
-        }
-
-        audioRecord = record
-        val job = scope.launch { readLoop(record) }
-        // Release only once the read loop has exited so release() never races an in-flight read().
-        job.invokeOnCompletion { record.release() }
-        captureJob = job
         return true
     }
 
-    @SuppressLint("MissingPermission")
-    private fun createAudioRecord(bufferBytes: Int): AudioRecord =
-        AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE, CHANNEL, ENCODING, bufferBytes)
-
-    private fun CoroutineScope.readLoop(record: AudioRecord) {
+    private fun CoroutineScope.readLoop() {
         val buffer = ShortArray(FRAME_SAMPLES)
         while (isActive) {
-            val read = record.read(buffer, 0, buffer.size)
+            val read = try {
+                source.read(buffer)
+            } catch (e: SecurityException) {
+                failFromLoop(CaptureErrors.PERMISSION_DENIED, ErrorRecovery.OpenAppSettings)
+                return
+            } catch (e: RuntimeException) {
+                Log.w(TAG, "Audio read threw ${e.javaClass.simpleName}")
+                failFromLoop(CaptureErrors.GENERIC_READ, ErrorRecovery.Retry)
+                return
+            }
+            if (!isActive) return
             if (read < 0) {
-                Log.w(TAG, "AudioRecord read error code=$read")
-                onError("Microphone read failed")
-                break
+                Log.w(TAG, "Audio read error code=$read")
+                failFromLoop(CaptureErrors.forReadCode(read), ErrorRecovery.Retry)
+                return
             }
             if (read == 0) continue
             for (listener in listeners) {
@@ -124,37 +125,70 @@ class AudioCaptureController(
         }
     }
 
-    /** Stops capture and releases the microphone. Safe to call repeatedly. */
-    @Synchronized
-    fun stop() {
-        val job = captureJob
-        captureJob = null
-        job?.cancel()
-        audioRecord?.let { record ->
-            try {
-                // Stopping unblocks a pending read(); the job completion handler then releases.
-                if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) record.stop()
-            } catch (e: IllegalStateException) {
-                Log.w(TAG, "AudioRecord stop failed")
-            }
-            if (job == null) record.release()
+    private fun failFromLoop(message: String, recovery: ErrorRecovery) {
+        val wasRunning = synchronized(lock) {
+            val running = phase == Phase.Running
+            phase = Phase.Stopped
+            running
         }
-        audioRecord = null
+        if (wasRunning) reportError(message, recovery)
     }
 
-    /** Stops capture and tears down the coroutine scope; the instance is unusable afterwards. */
-    fun release() {
-        stop()
-        listeners.clear()
-        scope.cancel()
+    private fun reportError(message: String, recovery: ErrorRecovery) {
+        if (errorReported) return
+        errorReported = true
+        onError(message, recovery)
     }
+
+    /** Requests stop without waiting. The microphone is released once the read loop exits. */
+    fun stop() {
+        val job = synchronized(lock) {
+            val wasNew = phase == Phase.New
+            phase = Phase.Stopped
+            if (wasNew) {
+                scope.cancel()
+                return
+            }
+            captureJob
+        }
+        listeners.clear()
+        job?.cancel()
+        try {
+            // Unblocks a pending read(); the job's completion handler then releases the source.
+            source.stop()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Audio source stop failed: ${e.javaClass.simpleName}")
+        }
+        scope.cancel()
+        if (job == null) releaseSourceOnce()
+    }
+
+    /** Stops and suspends until the microphone has actually been released. */
+    suspend fun stopAndJoin() {
+        stop()
+        synchronized(lock) { captureJob }?.join()
+        // The completion handler normally released it already; this is a no-op then.
+        releaseSourceOnce()
+    }
+
+    private fun releaseSourceOnce() {
+        synchronized(lock) {
+            if (released) return
+            released = true
+        }
+        try {
+            source.release()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Audio source release failed: ${e.javaClass.simpleName}")
+        }
+    }
+
+    /** Test hook: true once the source has been released. */
+    internal val isReleased: Boolean get() = synchronized(lock) { released }
 
     companion object {
         private const val TAG = "AudioCapture"
-        const val SAMPLE_RATE = 16_000
+        const val SAMPLE_RATE = AndroidAudioRecordSource.SAMPLE_RATE
         const val FRAME_SAMPLES = 512
-        private const val BYTES_PER_SAMPLE = 2
-        private const val CHANNEL = AudioFormat.CHANNEL_IN_MONO
-        private const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
     }
 }

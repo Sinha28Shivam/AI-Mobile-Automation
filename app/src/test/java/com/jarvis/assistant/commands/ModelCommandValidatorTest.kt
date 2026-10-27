@@ -11,7 +11,7 @@ class ModelCommandValidatorTest {
     @Test fun validCommands() {
         assertEquals(JarvisCommand.OpenApp("YouTube"), v.validate("""{"tool":"open_app","args":{"app_name":"YouTube"}}"""))
         assertEquals(JarvisCommand.GetBattery, v.validate("""{"tool":"get_battery","args":{}}"""))
-        assertEquals(JarvisCommand.GetTime, v.validate("""{"tool":"get_time"}"""))
+        assertEquals(JarvisCommand.GetTime, v.validate("""{"tool":"get_time","args":{}}"""))
         assertEquals(
             JarvisCommand.OpenSettings(SettingsDestination.WIFI),
             v.validate(""" { "tool" : "open_settings", "args" : { "destination" : "wifi" } } """),
@@ -20,8 +20,8 @@ class ModelCommandValidatorTest {
             JarvisCommand.CreateReminder("call mom", 15),
             v.validate("""{"tool":"create_reminder","args":{"title":"call mom","delay_minutes":15}}"""),
         )
-        assertEquals(JarvisCommand.ReadLatestNotification, v.validate("""{"tool":"read_latest_notification"}"""))
-        assertEquals(JarvisCommand.GetTime, v.validate("```json\n{\"tool\":\"get_time\"}\n```"))
+        assertEquals(JarvisCommand.ReadLatestNotification, v.validate("""{"tool":"read_latest_notification","args":{}}"""))
+        assertEquals(JarvisCommand.GetTime, v.validate("```json\n{\"tool\":\"get_time\",\"args\":{}}\n```"))
     }
 
     @Test fun unknownToolsRejected() {
@@ -71,6 +71,38 @@ class ModelCommandValidatorTest {
     @Test fun oversizeRejected() {
         val big = """{"tool":"open_app","args":{"app_name":"${"a".repeat(2100)}"}}"""
         assertNull(v.validate(big))
+    }
+
+    @Test fun exactSchemaRequired() {
+        assertNull("args is mandatory", v.validate("""{"tool":"get_time"}"""))
+        assertNull(v.validate("""{"args":{}}"""))
+        assertNull(v.validate("""{"tool":"get_time","args":null}"""))
+        assertNull(v.validate("""{"tool":"get_time","args":{},"reason":"x"}"""))
+        assertNull(v.validate("""{"tool":"open_app","args":{"app_name":"x","app_name":"y"}}"""))
+        assertNull(v.validate("""{"tool":"open_app","args":{"app_name":true}}"""))
+        assertNull(v.validate("""{"tool":"open_app","args":{"app_name":null}}"""))
+        assertNull(v.validate("""{"tool":"open_settings","args":{"destination":{"name":"wifi"}}}"""))
+        assertNull(v.validate("""{"tool":"stop_listening","args":{}}"""))
+        assertNull(v.validate("""{"tool":"repeat","args":{}}"""))
+        assertEquals(JarvisCommand.GetDate, v.validate("""{"tool":"get_date","args":{}}"""))
+    }
+
+    @Test fun appNameLimits() {
+        assertEquals(JarvisCommand.OpenApp("a".repeat(50)), v.validate("""{"tool":"open_app","args":{"app_name":"${"a".repeat(50)}"}}"""))
+        assertNull(v.validate("""{"tool":"open_app","args":{"app_name":"${"a".repeat(51)}"}}"""))
+        assertNull(v.validate("""{"tool":"open_app","args":{"app_name":"com.evil/.Main"}}"""))
+        assertNull(v.validate("""{"tool":"open_app","args":{"app_name":"http://x"}}"""))
+        assertEquals(JarvisCommand.OpenApp("Café Ñandú"), v.validate("""{"tool":"open_app","args":{"app_name":"Café Ñandú"}}"""))
+    }
+
+    @Test fun unicodeTricksRejected() {
+        assertNull(v.validate("{\"tool\":\"open_app\",\"args\":{\"app_name\":\"You\u200BTube\"}}"))
+        assertNull(v.validate("""{"tool":"open_app","args":{"app_name":"You\u200BTube"}}"""))
+        assertNull(v.validate("{\"tool\":\"open_app\",\"args\":{\"app_name\":\"You\u202ETube\"}}"))
+        assertNull(v.validate("{\"tool\":\"open_app\",\"args\":{\"app_name\":\"YouTube\uD83D\uDE00\"}}"))
+        assertNull(v.validate("\uFEFF{\"tool\":\"get_time\",\"args\":{}}"))
+        assertNull("homoglyph mix", v.validate("{\"tool\":\"open_app\",\"args\":{\"app_name\":\"Y\u043EuTube\"}}"))
+        assertNull(v.validate("{\"tool\":\"get_time\",\"args\":{}}\u0007"))
     }
 
     @Test fun injectionStringsRejected() {

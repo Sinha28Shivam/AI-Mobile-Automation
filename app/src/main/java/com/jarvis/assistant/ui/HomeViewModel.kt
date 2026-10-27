@@ -9,7 +9,10 @@ import com.jarvis.assistant.ai.ModelSpec
 import com.jarvis.assistant.ai.ModelState
 import com.jarvis.assistant.data.JarvisSettings
 import com.jarvis.assistant.data.LocalHistoryRepository
+import com.jarvis.assistant.service.ErrorRecovery
 import com.jarvis.assistant.service.ServiceNoticeRepository
+import com.jarvis.assistant.service.VoiceMetrics
+import com.jarvis.assistant.service.VoiceMetricsSnapshot
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import com.jarvis.assistant.data.PreferencesRepository
@@ -35,6 +38,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     val modelSpec: ModelSpec = modelManager.spec
     val lastExchange: StateFlow<LastExchange?> = LastExchangeRepository.last
     val notice: StateFlow<String?> = ServiceNoticeRepository.notice
+    val diagnostics: StateFlow<VoiceMetricsSnapshot> = VoiceMetrics.shared.snapshot
 
     private val history = LocalHistoryRepository.get(application)
     private val _historyCount = MutableStateFlow(0)
@@ -66,7 +70,9 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             return false
         }
         if (modelState.value !is ModelState.Ready) {
-            ServiceStateRepository.update(ServiceState.Error(JarvisForegroundService.MODEL_MISSING_MESSAGE))
+            ServiceStateRepository.update(
+                ServiceState.Error(JarvisForegroundService.MODEL_MISSING_MESSAGE, ErrorRecovery.OpenModelSetup),
+            )
             return false
         }
         return true
@@ -116,7 +122,16 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearModelError() {
-        if (ServiceStateRepository.state.value == ServiceState.Error(JarvisForegroundService.MODEL_MISSING_MESSAGE)) {
+        val current = ServiceStateRepository.state.value
+        if (current is ServiceState.Error && current.recovery == ErrorRecovery.OpenModelSetup) {
+            ServiceStateRepository.update(ServiceState.Stopped)
+        }
+    }
+
+    /** Clears a permission/error state after the user has acted on it (e.g. returned from settings). */
+    fun dismissError() {
+        val current = ServiceStateRepository.state.value
+        if (current is ServiceState.Error || current == ServiceState.PermissionRequired) {
             ServiceStateRepository.update(ServiceState.Stopped)
         }
     }

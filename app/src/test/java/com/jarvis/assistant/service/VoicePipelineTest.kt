@@ -239,6 +239,210 @@ class VoicePipelineTest {
         assertTrue(stt.released)
     }
 
+    private fun awaitTrue(block: () -> Boolean) = runBlocking {
+        withTimeout(5_000) { while (!block()) kotlinx.coroutines.delay(2) }
+    }
+
+    @Test
+    fun wakePhraseIsStrippedFromCommand() {
+        val handled = CompletableDeferred<String>()
+        val pipeline = VoicePipeline(
+            wakeWord = FakeWakeWord(),
+            speechToText = FakeStt(SpeechResult("hey jarvis open youtube", 0.9f, UtteranceEnd.EndOfSpeech)),
+            commandHandler = { text, _ -> handled.complete(text); HandlerResult(null) },
+            setState = record,
+        )
+        pipeline.start()
+        feedUntil(pipeline, handled)
+        pipeline.stop()
+        assertEquals("open youtube", runBlocking { handled.await() })
+    }
+
+    @Test
+    fun wakePhraseOnlyNeverReachesHandler() {
+        val spoken = CompletableDeferred<String>()
+        var called = false
+        val pipeline = VoicePipeline(
+            wakeWord = FakeWakeWord(),
+            speechToText = FakeStt(SpeechResult("jarvis", 1f, UtteranceEnd.EndOfSpeech)),
+            commandHandler = { _, _ -> called = true; HandlerResult("x") },
+            speaker = { spoken.complete(it) },
+            setState = record,
+        )
+        pipeline.start()
+        feedUntil(pipeline, spoken)
+        pipeline.stop()
+        assertFalse(called)
+        assertEquals(VoicePipeline.NO_COMMAND_REPLY, runBlocking { spoken.await() })
+    }
+
+    @Test
+    fun lowConfidenceGateUsesConfiguredThresholdAndNeverCallsHandler() {
+        val spoken = CompletableDeferred<String>()
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        val metrics = VoiceMetrics()
+        val pipeline = VoicePipeline(
+            wakeWord = FakeWakeWord(),
+            speechToText = FakeStt(SpeechResult("delete everything", 0.59f, UtteranceEnd.EndOfSpeech)),
+            commandHandler = { _, _ -> calls.incrementAndGet(); HandlerResult("done") },
+            speaker = { spoken.complete(it) },
+            setState = record,
+            minCommandConfidence = 0.6f,
+            metrics = metrics,
+        )
+        pipeline.start()
+        feedUntil(pipeline, spoken)
+        pipeline.stop()
+        assertEquals(0, calls.get())
+        assertEquals(VoicePipeline.LOW_CONFIDENCE_REPLY, runBlocking { spoken.await() })
+        assertEquals(1, metrics.snapshot.value.lowConfidence)
+    }
+
+    @Test
+    fun ttsFailureReturnsToListening() {
+        val listening = CompletableDeferred<Unit>()
+        val metrics = VoiceMetrics()
+        val pipeline = VoicePipeline(
+            wakeWord = FakeWakeWord(),
+            speechToText = FakeStt(SpeechResult("hello", 1f, UtteranceEnd.EndOfSpeech)),
+            speaker = { throw IllegalStateException("tts dead") },
+            setState = { states += it; if (it == ServiceState.Listening) listening.complete(Unit); true },
+            metrics = metrics,
+        )
+        pipeline.start()
+        feedUntil(pipeline, listening)
+        pipeline.stop()
+        assertTrue(states.contains(ServiceState.Speaking))
+        assertEquals(1, metrics.snapshot.value.speechOutputFailures)
+    }
+
+    @Test
+    fun ttsHangTimesOutAndReturnsToListening() {
+        val listening = CompletableDeferred<Unit>()
+        val pipeline = VoicePipeline(
+            wakeWord = FakeWakeWord(),
+            speechToText = FakeStt(SpeechResult("hello", 1f, UtteranceEnd.EndOfSpeech)),
+            speaker = { CompletableDeferred<Unit>().await() },
+            setState = { states += it; if (it == ServiceState.Listening) listening.complete(Unit); true },
+            speakTimeoutMs = 50,
+        )
+        pipeline.start()
+        feedUntil(pipeline, listening)
+        pipeline.stop()
+    }
+
+    @Test
+    fun handlerTimeoutGivesErrorReply() {
+        val spoken = CompletableDeferred<String>()
+        val pipeline = VoicePipeline(
+            wakeWord = FakeWakeWord(),
+            speechToText = FakeStt(SpeechResult("slow", 1f, UtteranceEnd.EndOfSpeech)),
+            commandHandler = { _, _ -> CompletableDeferred<Unit>().await(); HandlerResult("never") },
+            speaker = { spoken.complete(it) },
+            setState = record,
+            handlerTimeoutMs = 50,
+        )
+        pipeline.start()
+        feedUntil(pipeline, spoken)
+        pipeline.stop()
+        assertEquals(VoicePipeline.ERROR_REPLY, runBlocking { spoken.await() })
+    }
+
+    @Test
+    fun recognizerFinishFailureGivesRetryPromptNotStuck() {
+        val spoken = CompletableDeferred<String>()
+        val stt = object : SpeechToTextEngine {
+            private var n = 0
+            override fun startUtterance() { n = 0 }
+            override fun acceptFrame(frame: ShortArray, length: Int): UtteranceStatus =
+                if (++n >= 2) UtteranceStatus.Ended(UtteranceEnd.EndOfSpeech) else UtteranceStatus.InProgress
+            override fun finish(reason: UtteranceEnd): SpeechResult = throw IllegalStateException("bad json")
+            override fun release() {}
+        }
+        val pipeline = VoicePipeline(FakeWakeWord(), stt, speaker = { spoken.complete(it) }, setState = record)
+        pipeline.start()
+        feedUntil(pipeline, spoken)
+        pipeline.stop()
+        assertEquals(VoicePipeline.LOW_CONFIDENCE_REPLY, runBlocking { spoken.await() })
+    }
+
+    @Test
+    fun duplicateWakeTriggerInOneUtteranceStartsOneSession() {
+        val wake = FakeWakeWord()
+        val stt = FakeStt(SpeechResult("hi", 1f, UtteranceEnd.EndOfSpeech), framesPerUtterance = 1_000_000)
+        val pipeline = VoicePipeline(wake, stt, setState = record)
+        pipeline.start()
+        // Many wake frames in a row (same utterance): only the first one starts a session.
+        repeat(20) { pipeline.offerFrame(frame(WAKE), 4) }
+        awaitTrue { stt.utterances >= 1 }
+        Thread.sleep(50)
+        assertEquals(1, stt.utterances)
+        assertEquals(1, states.count { it == ServiceState.HeardWakeWord })
+        pipeline.stop()
+    }
+
+    @Test
+    fun cooldownRestartsWhenSessionEnds() {
+        val ended = java.util.concurrent.atomic.AtomicInteger()
+        val wake = object : WakeWordDetector by FakeWakeWord() {
+            override fun onSessionEnded() { ended.incrementAndGet() }
+        }
+        val listening = CompletableDeferred<Unit>()
+        val pipeline = VoicePipeline(
+            wakeWord = wake,
+            speechToText = FakeStt(SpeechResult("hello", 1f, UtteranceEnd.EndOfSpeech)),
+            setState = { if (it == ServiceState.Listening) listening.complete(Unit); true },
+        )
+        pipeline.start()
+        feedUntil(pipeline, listening)
+        pipeline.stop()
+        assertEquals(1, ended.get())
+    }
+
+    @Test
+    fun rejectedStateWriteStopsPipelineInsteadOfContinuing() {
+        val wake = FakeWakeWord()
+        val stt = FakeStt(SpeechResult("hello", 1f, UtteranceEnd.EndOfSpeech))
+        var called = false
+        val pipeline = VoicePipeline(
+            wakeWord = wake,
+            speechToText = stt,
+            commandHandler = { _, _ -> called = true; HandlerResult("x") },
+            setState = { false }, // session is stale
+        )
+        pipeline.start()
+        pipeline.offerFrame(frame(WAKE), 4)
+        awaitTrue { pipeline.isStopped && wake.released && stt.released }
+        assertFalse(called)
+    }
+
+    @Test
+    fun stopAndJoinWaitsForRelease() = runBlocking {
+        val wake = FakeWakeWord()
+        val stt = FakeStt(SpeechResult("", 0f, UtteranceEnd.NoSpeech))
+        var releasedCallbacks = 0
+        val pipeline = VoicePipeline(wake, stt, setState = record, onReleased = { releasedCallbacks++ })
+        assertTrue(pipeline.start())
+        withTimeout(5_000) { pipeline.stopAndJoin() }
+        assertTrue(wake.released && stt.released)
+        pipeline.stop()
+        withTimeout(5_000) { pipeline.stopAndJoin() }
+        assertEquals(1, releasedCallbacks)
+        assertFalse("a stopped pipeline cannot be restarted", pipeline.start())
+    }
+
+    @Test
+    fun framesAfterStopAreDropped() {
+        val wake = FakeWakeWord()
+        val pipeline = VoicePipeline(wake, FakeStt(SpeechResult("", 0f, UtteranceEnd.NoSpeech)), setState = record)
+        pipeline.start()
+        runBlocking { withTimeout(5_000) { pipeline.stopAndJoin() } }
+        val seen = wake.framesSeen
+        repeat(10) { pipeline.offerFrame(frame(WAKE), 4) }
+        Thread.sleep(30)
+        assertEquals(seen, wake.framesSeen)
+    }
+
     private companion object {
         const val WAKE: Short = 42
     }

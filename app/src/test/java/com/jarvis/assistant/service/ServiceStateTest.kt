@@ -28,9 +28,10 @@ class ServiceStateTest {
             ServiceState.HeardWakeWord,
             ServiceState.Processing,
             ServiceState.Speaking,
+            ServiceState.MicrophoneSilenced,
         )
             .forEach { assertTrue("$it should be active", it.isActive) }
-        listOf(ServiceState.Stopped, ServiceState.PermissionRequired, ServiceState.Error("x"))
+        listOf(ServiceState.Stopped, ServiceState.Stopping, ServiceState.PermissionRequired, ServiceState.Error("x"))
             .forEach { assertFalse("$it should be inactive", it.isActive) }
     }
 

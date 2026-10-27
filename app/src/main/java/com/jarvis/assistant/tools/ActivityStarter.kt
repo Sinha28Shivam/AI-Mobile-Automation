@@ -67,6 +67,8 @@ object ActivityStarter {
     private fun postTapToOpen(context: Context, target: Intent, label: String): Boolean {
         if (!AndroidReminderTool.canNotify(context)) return false
         ensureChannel(context)
+        val channel = NotificationManagerCompat.from(context).getNotificationChannel(CHANNEL_ID)
+        if (channel != null && channel.importance == NotificationManager.IMPORTANCE_NONE) return false
         val pending = PendingIntent.getActivity(
             context,
             NOTIFICATION_ID,

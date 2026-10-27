@@ -84,6 +84,47 @@ class WakeWordDeciderTest {
         assertNotNull(decider.evaluateFinal(words("jarvis" to 1f), 0.5f, 10))
     }
 
+    @Test
+    fun strictSensitivityRequiresFullPhrase() {
+        val decider = WakeWordDecider()
+        assertNull(decider.evaluateFinal(words("jarvis" to 1f), sensitivity = 0.2f, nowMs = 0))
+        assertNull(decider.evaluateFinal(words("jarvis" to 1f, "hey" to 1f), sensitivity = 0.2f, nowMs = 0))
+        assertNotNull(decider.evaluateFinal(words("hey" to 1f, "jarvis" to 1f), sensitivity = 0.2f, nowMs = 0))
+    }
+
+    @Test
+    fun higherSensitivityAcceptsKeywordAlone() {
+        assertNotNull(WakeWordDecider().evaluateFinal(words("jarvis" to 1f), sensitivity = 0.5f, nowMs = 0))
+        assertTrue(WakeWordDecider.requiresFullPhrase(0f))
+        assertFalse(WakeWordDecider.requiresFullPhrase(0.5f))
+    }
+
+    @Test
+    fun loudnessFloorScalesWithSensitivity() {
+        assertEquals(300.0, WakeWordDecider.minimumRms(0f), 0.001)
+        assertEquals(0.0, WakeWordDecider.minimumRms(1f), 0.001)
+        val decider = WakeWordDecider()
+        val hit = words("hey" to 1f, "jarvis" to 1f)
+        assertNull("quiet speech rejected when strict", decider.evaluateFinal(hit, 0.2f, 0, peakRms = 100.0))
+        assertNotNull("same speech accepted when lenient", decider.evaluateFinal(hit, 0.9f, 0, peakRms = 100.0))
+        assertFalse(WakeWordDecider().evaluatePartial("jarvis", 0.9f, 0, peakRms = 10.0))
+    }
+
+    @Test
+    fun rmsOfFrame() {
+        assertEquals(0.0, WakeWordDecider.rms(ShortArray(4), 4), 0.0)
+        assertEquals(100.0, WakeWordDecider.rms(shortArrayOf(100, -100, 100, -100), 4), 0.001)
+        assertEquals(0.0, WakeWordDecider.rms(ShortArray(0), 0), 0.0)
+    }
+
+    @Test
+    fun restartCooldownBlocksUntilWindowPasses() {
+        val decider = WakeWordDecider(cooldownMs = 1_000)
+        decider.restartCooldown(5_000)
+        assertNull(decider.evaluateFinal(words("jarvis" to 1f), 0.5f, 5_500))
+        assertNotNull(decider.evaluateFinal(words("jarvis" to 1f), 0.5f, 6_000))
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun blankKeywordRejected() {
         WakeWordDecider(keyword = "  ")
