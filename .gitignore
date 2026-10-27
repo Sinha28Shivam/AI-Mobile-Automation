@@ -1,0 +1,29 @@
+# Build output
+build/
+*/build/
+.gradle/
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Local config & secrets
+local.properties
+*.jks
+*.keystore
+keystore.properties
+.env
+
+# Models (never commit)
+models/
+*.onnx
+*.gguf
+*.ppn
+app/src/main/assets/models/

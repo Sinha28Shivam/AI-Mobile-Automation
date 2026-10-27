@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">JARVIS</string>
+    <string name="notification_channel_name">Listening status</string>
+    <string name="notification_channel_description">Shows when JARVIS is using the microphone.</string>
+    <string name="notification_title">JARVIS is listening</string>
+    <string name="notification_text">Microphone active. Audio is processed on-device and never saved.</string>
+    <string name="notification_action_stop">Stop</string>
+</resources>
